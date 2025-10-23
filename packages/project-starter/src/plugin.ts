@@ -95,7 +95,7 @@ const helloWorldAction: Action = {
         success: true,
       };
     } catch (error) {
-      logger.error('Error in HELLO_WORLD action:', error);
+      logger.error({ error }, 'Error in HELLO_WORLD action:');
 
       return {
         text: 'Failed to send hello world greeting',
@@ -202,11 +202,13 @@ const plugin: Plugin = {
       }
     } catch (error) {
       if (error instanceof z.ZodError) {
-        throw new Error(
-          `Invalid plugin configuration: ${error.errors.map((e) => e.message).join(', ')}`
-        );
+        const errorMessages =
+          error.issues?.map((e) => e.message)?.join(', ') || 'Unknown validation error';
+        throw new Error(`Invalid plugin configuration: ${errorMessages}`);
       }
-      throw error;
+      throw new Error(
+        `Invalid plugin configuration: ${error instanceof Error ? error.message : String(error)}`
+      );
     }
   },
   models: {
@@ -248,28 +250,28 @@ const plugin: Plugin = {
       async (params) => {
         logger.info('MESSAGE_RECEIVED event received');
         // print the keys
-        logger.info(Object.keys(params));
+        logger.info({ keys: Object.keys(params) }, 'MESSAGE_RECEIVED param keys');
       },
     ],
     VOICE_MESSAGE_RECEIVED: [
       async (params) => {
         logger.info('VOICE_MESSAGE_RECEIVED event received');
         // print the keys
-        logger.info(Object.keys(params));
+        logger.info({ keys: Object.keys(params) }, 'VOICE_MESSAGE_RECEIVED param keys');
       },
     ],
     WORLD_CONNECTED: [
       async (params) => {
         logger.info('WORLD_CONNECTED event received');
         // print the keys
-        logger.info(Object.keys(params));
+        logger.info({ keys: Object.keys(params) }, 'WORLD_CONNECTED param keys');
       },
     ],
     WORLD_JOINED: [
       async (params) => {
         logger.info('WORLD_JOINED event received');
         // print the keys
-        logger.info(Object.keys(params));
+        logger.info({ keys: Object.keys(params) }, 'WORLD_JOINED param keys');
       },
     ],
   },

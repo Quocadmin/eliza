@@ -3,21 +3,26 @@ import { displayBanner, handleError } from '@/src/utils';
 import { buildProject } from '@/src/utils/build-project';
 import { ensureElizaOSCli } from '@/src/utils/dependency-manager';
 import { detectDirectoryType } from '@/src/utils/directory-detection';
-import { getModuleLoader } from '@/src/utils/module-loader';
-import { validatePort } from '@/src/utils/port-validation';
 import { logger, type Character, type ProjectAgent } from '@elizaos/core';
-import { Command } from 'commander';
+import { AgentServer, loadCharacterTryPath } from '@elizaos/server';
+import { Command, InvalidOptionArgumentError } from 'commander';
+import dotenv from 'dotenv';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { startAgents } from './actions/server-start';
 import { StartOptions } from './types';
-import { loadEnvConfig } from './utils/config-utils';
+import { UserEnvironment } from '@/src/utils/user-environment';
 
 export const start = new Command()
   .name('start')
   .description('Build and start the Eliza agent server')
   .option('-c, --configure', 'Reconfigure services and AI models')
-  .option('-p, --port <port>', 'Port to listen on', validatePort)
+  .option('-p, --port <port>', 'Port to listen on', (value: string) => {
+    const n = Number.parseInt(value, 10);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      throw new InvalidOptionArgumentError('Port must be an integer between 1 and 65535');
+    }
+    return n;
+  })
   .option('--character <paths...>', 'Character file(s) to use')
   .hook('preAction', async () => {
     await displayBanner();
@@ -25,7 +30,21 @@ export const start = new Command()
   .action(async (options: StartOptions & { character?: string[] }) => {
     try {
       // Load env config first before any character loading
-      await loadEnvConfig();
+      // Use monorepo-aware resolver so root .env is found when running via turbo
+      try {
+        const userEnv = UserEnvironment.getInstance();
+        const { envFilePath } = await userEnv.getPathInfo();
+        const candidateEnv = envFilePath || path.join(process.cwd(), '.env');
+        if (fs.existsSync(candidateEnv)) {
+          dotenv.config({ path: candidateEnv });
+        }
+      } catch {
+        // Fallback to CWD-based .env if resolution fails
+        const envPath = path.join(process.cwd(), '.env');
+        if (fs.existsSync(envPath)) {
+          dotenv.config({ path: envPath });
+        }
+      }
 
       // Auto-install @elizaos/cli as dev dependency using bun (for non-monorepo projects)
       await ensureElizaOSCli();
@@ -47,6 +66,11 @@ export const start = new Command()
         process.env.PATH = localBinPath;
       }
 
+      // Force Node runtime for PGlite when running the server via CLI
+      if (!process.env.PGLITE_WASM_MODE) {
+        process.env.PGLITE_WASM_MODE = 'node';
+      }
+
       // Build the project first (unless it's a monorepo)
       const cwd = process.cwd();
       const dirInfo = detectDirectoryType(cwd);
@@ -57,7 +81,7 @@ export const start = new Command()
           // Use buildProject function with proper UI feedback and error handling
           await buildProject(cwd, false);
         } catch (error) {
-          logger.error(`Build error: ${error instanceof Error ? error.message : String(error)}`);
+          logger.error('Build error:', error instanceof Error ? error.message : String(error));
           logger.warn(
             'Build failed, but continuing with start. Some features may not work correctly.'
           );
@@ -68,11 +92,6 @@ export const start = new Command()
       let projectAgents: ProjectAgent[] = [];
 
       if (options.character && options.character.length > 0) {
-        // Load @elizaos/server module for character loading
-        const moduleLoader = getModuleLoader();
-        const serverModule = await moduleLoader.load('@elizaos/server');
-        const { loadCharacterTryPath } = serverModule;
-
         // Validate and load characters from provided paths
         for (const charPath of options.character) {
           const resolvedPath = path.resolve(charPath);
@@ -94,7 +113,7 @@ export const start = new Command()
               throw new Error(`Invalid character file: ${resolvedPath}`);
             }
           } catch (e) {
-            logger.error(`Failed to load character from ${resolvedPath}:`, e);
+            logger.error({ error: e, resolvedPath }, `Failed to load character from path:`);
             throw new Error(`Invalid character file: ${resolvedPath}`);
           }
         }
@@ -123,21 +142,35 @@ export const start = new Command()
             }
           }
         } catch (e) {
-          logger.debug('Failed to load project agents, will use default character:', e);
+          logger.debug({ error: e }, 'Failed to load project agents, will use default character:');
         }
       }
 
-      await startAgents({ ...options, characters, projectAgents });
+      // Prepare agent configurations (unified handling)
+      const agentConfigs = projectAgents?.length
+        ? projectAgents.map((pa) => ({
+            character: pa.character,
+            plugins: Array.isArray(pa.plugins) ? pa.plugins : [],
+            init: pa.init,
+          }))
+        : characters?.map((character) => ({ character })) || [];
+
+      // Use AgentServer with unified startup
+      const server = new AgentServer();
+      await server.start({
+        port: options.port,
+        dataDir: process.env.PGLITE_DATA_DIR,
+        postgresUrl: process.env.POSTGRES_URL,
+        agents: agentConfigs,
+      });
+
+      // Server handles initialization, port resolution, and agent startup automatically
+      logger.success(`Server started with ${agentConfigs.length} agents`);
     } catch (e: any) {
       handleError(e);
       process.exit(1);
     }
   });
 
-// Re-export for backward compatibility
-export * from './actions/agent-start';
-export * from './actions/server-start';
+// Export types only
 export * from './types';
-export * from './utils/config-utils';
-export * from './utils/dependency-resolver';
-export * from './utils/plugin-utils';

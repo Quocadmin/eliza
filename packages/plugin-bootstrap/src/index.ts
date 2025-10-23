@@ -1,14 +1,13 @@
 import {
   type ActionEventPayload,
-  asUUID,
   ChannelType,
   composePromptFromState,
   type Content,
+  type ControlMessage,
   ContentType,
   createUniqueUuid,
   type EntityPayload,
   type EvaluatorEventPayload,
-  type EventPayload,
   EventType,
   type IAgentRuntime,
   imageDescriptionTemplate,
@@ -16,19 +15,17 @@ import {
   logger,
   type Media,
   type Memory,
+  type MentionContext,
   messageHandlerTemplate,
   type MessagePayload,
-  type MessageReceivedHandlerParams,
   ModelType,
   parseKeyValueXml,
   type Plugin,
   PluginEvents,
   postCreationTemplate,
-  parseBooleanFromText,
   Role,
   type Room,
-  shouldRespondTemplate,
-  truncateToCompleteSentence,
+  type RunEventPayload,
   type UUID,
   type WorldPayload,
   getLocalServerUrl,
@@ -40,6 +37,7 @@ import * as evaluators from './evaluators/index.ts';
 import * as providers from './providers/index.ts';
 
 import { TaskService } from './services/task.ts';
+import { EmbeddingGenerationService } from './services/embedding.ts';
 
 export * from './actions/index.ts';
 export * from './evaluators/index.ts';
@@ -55,8 +53,6 @@ type MediaData = {
   data: Buffer;
   mediaType: string;
 };
-
-const latestResponseIds = new Map<string, Map<string, string>>();
 
 /**
  * Escapes special characters in a string to make it JSON-safe.
@@ -190,16 +186,34 @@ export async function processAttachments(
             // Parse XML response
             const parsedXml = parseKeyValueXml(response);
 
-            if (parsedXml?.description && parsedXml?.text) {
-              processedAttachment.description = parsedXml.description;
+            if (parsedXml && (parsedXml.description || parsedXml.text)) {
+              processedAttachment.description = parsedXml.description || '';
               processedAttachment.title = parsedXml.title || 'Image';
-              processedAttachment.text = parsedXml.text;
+              processedAttachment.text = parsedXml.text || parsedXml.description || '';
 
               runtime.logger.debug(
                 `[Bootstrap] Generated description: ${processedAttachment.description?.substring(0, 100)}...`
               );
             } else {
-              runtime.logger.warn(`[Bootstrap] Failed to parse XML response for image description`);
+              // Fallback: Try simple regex parsing if parseKeyValueXml fails
+              const responseStr = response as string;
+              const titleMatch = responseStr.match(/<title>([^<]+)<\/title>/);
+              const descMatch = responseStr.match(/<description>([^<]+)<\/description>/);
+              const textMatch = responseStr.match(/<text>([^<]+)<\/text>/);
+
+              if (titleMatch || descMatch || textMatch) {
+                processedAttachment.title = titleMatch?.[1] || 'Image';
+                processedAttachment.description = descMatch?.[1] || '';
+                processedAttachment.text = textMatch?.[1] || descMatch?.[1] || '';
+
+                runtime.logger.debug(
+                  `[Bootstrap] Used fallback XML parsing - description: ${processedAttachment.description?.substring(0, 100)}...`
+                );
+              } else {
+                runtime.logger.warn(
+                  `[Bootstrap] Failed to parse XML response for image description`
+                );
+              }
             }
           } else if (response && typeof response === 'object' && 'description' in response) {
             // Handle object responses for backwards compatibility
@@ -214,7 +228,7 @@ export async function processAttachments(
             runtime.logger.warn(`[Bootstrap] Unexpected response format for image description`);
           }
         } catch (error) {
-          runtime.logger.error(`[Bootstrap] Error generating image description:`, error);
+          runtime.logger.error({ error }, `[Bootstrap] Error generating image description:`);
           // Continue processing without description
         }
       } else if (attachment.contentType === ContentType.DOCUMENT && !attachment.text) {
@@ -241,7 +255,10 @@ export async function processAttachments(
 
       processedAttachments.push(processedAttachment);
     } catch (error) {
-      runtime.logger.error(`[Bootstrap] Failed to process attachment ${attachment.url}:`, error);
+      runtime.logger.error(
+        { error, attachmentUrl: attachment.url },
+        `[Bootstrap] Failed to process attachment ${attachment.url}:`
+      );
       // Add the original attachment if processing fails
       processedAttachments.push(attachment);
     }
@@ -251,649 +268,94 @@ export async function processAttachments(
 }
 
 /**
- * Determines whether to skip the shouldRespond logic based on room type and message source.
- * Supports both default values and runtime-configurable overrides via env settings.
+ * Determines whether the agent should respond to a message.
+ * Uses simple rules for obvious cases (DM, mentions, specific sources) and defers to LLM for ambiguous cases.
+ *
+ * @returns Object containing:
+ *  - shouldRespond: boolean - whether the agent should respond (only relevant if skipEvaluation is true)
+ *  - skipEvaluation: boolean - whether we can skip the LLM evaluation (decision made by simple rules)
+ *  - reason: string - explanation for debugging
  */
-export function shouldBypassShouldRespond(
+export function shouldRespond(
   runtime: IAgentRuntime,
+  message: Memory,
   room?: Room,
-  source?: string
-): boolean {
-  if (!room) return false;
+  mentionContext?: MentionContext
+): { shouldRespond: boolean; skipEvaluation: boolean; reason: string } {
+  if (!room) {
+    return { shouldRespond: false, skipEvaluation: true, reason: 'no room context' };
+  }
 
   function normalizeEnvList(value: unknown): string[] {
     if (!value || typeof value !== 'string') return [];
-
-    const cleaned = value.trim().replace(/^\[|\]$/g, '');
+    const cleaned = value.trim().replace(/^[\[]|[\]]$/g, '');
     return cleaned
       .split(',')
       .map((v) => v.trim())
       .filter(Boolean);
   }
 
-  const defaultBypassTypes = [
+  // Channel types that always trigger a response (private channels)
+  const alwaysRespondChannels = [
     ChannelType.DM,
     ChannelType.VOICE_DM,
     ChannelType.SELF,
     ChannelType.API,
   ];
 
-  const defaultBypassSources = ['client_chat'];
+  // Sources that always trigger a response
+  const alwaysRespondSources = ['client_chat'];
 
-  const bypassTypesSetting = normalizeEnvList(runtime.getSetting('SHOULD_RESPOND_BYPASS_TYPES'));
-  const bypassSourcesSetting = normalizeEnvList(
-    runtime.getSetting('SHOULD_RESPOND_BYPASS_SOURCES')
+  // Support runtime-configurable overrides via env settings
+  // Accepts both new and legacy setting names for backwards compatibility
+  const customChannels = normalizeEnvList(
+    runtime.getSetting('ALWAYS_RESPOND_CHANNELS') ||
+      runtime.getSetting('SHOULD_RESPOND_BYPASS_TYPES')
+  );
+  const customSources = normalizeEnvList(
+    runtime.getSetting('ALWAYS_RESPOND_SOURCES') ||
+      runtime.getSetting('SHOULD_RESPOND_BYPASS_SOURCES')
   );
 
-  const bypassTypes = new Set(
-    [...defaultBypassTypes.map((t) => t.toString()), ...bypassTypesSetting].map((s: string) =>
+  const respondChannels = new Set(
+    [...alwaysRespondChannels.map((t) => t.toString()), ...customChannels].map((s: string) =>
       s.trim().toLowerCase()
     )
   );
 
-  const bypassSources = [...defaultBypassSources, ...bypassSourcesSetting].map((s: string) =>
+  const respondSources = [...alwaysRespondSources, ...customSources].map((s: string) =>
     s.trim().toLowerCase()
   );
 
   const roomType = room.type?.toString().toLowerCase();
-  const sourceStr = source?.toLowerCase() || '';
-
-  return bypassTypes.has(roomType) || bypassSources.some((pattern) => sourceStr.includes(pattern));
-}
-
-/**
- * Handles incoming messages and generates responses based on the provided runtime and message information.
- *
- * @param {MessageReceivedHandlerParams} params - The parameters needed for message handling, including runtime, message, and callback.
- * @returns {Promise<void>} - A promise that resolves once the message handling and response generation is complete.
- */
-const messageReceivedHandler = async ({
-  runtime,
-  message,
-  callback,
-  onComplete,
-}: MessageReceivedHandlerParams): Promise<void> => {
-  // Set up timeout monitoring
-  const timeoutDuration = 60 * 60 * 1000; // 1 hour
-  let timeoutId: NodeJS.Timeout | undefined = undefined;
-
-  try {
-    runtime.logger.info(
-      `[Bootstrap] Message received from ${message.entityId} in room ${message.roomId}`
-    );
-    // Generate a new response ID
-    const responseId = v4();
-    // Get or create the agent-specific map
-    if (!latestResponseIds.has(runtime.agentId)) {
-      latestResponseIds.set(runtime.agentId, new Map<string, string>());
-    }
-    const agentResponses = latestResponseIds.get(runtime.agentId);
-    if (!agentResponses) {
-      throw new Error('Agent responses map not found');
-    }
-
-    // Log when we're updating the response ID
-    const previousResponseId = agentResponses.get(message.roomId);
-    if (previousResponseId) {
-      logger.warn(
-        `[Bootstrap] Updating response ID for room ${message.roomId} from ${previousResponseId} to ${responseId} - this may discard in-progress responses`
-      );
-    }
-
-    // Set this as the latest response ID for this agent+room
-    agentResponses.set(message.roomId, responseId);
-
-    // Use runtime's run tracking for this message processing
-    const runId = runtime.startRun();
-    const startTime = Date.now();
-
-    // Emit run started event
-    await runtime.emitEvent(EventType.RUN_STARTED, {
-      runtime,
-      runId,
-      messageId: message.id,
-      roomId: message.roomId,
-      entityId: message.entityId,
-      startTime,
-      status: 'started',
-      source: 'messageHandler',
-      // this shouldn't be a standard
-      // but we need to expose content somewhere
-      metadata: message.content,
-    });
-
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(async () => {
-        await runtime.emitEvent(EventType.RUN_TIMEOUT, {
-          runtime,
-          runId,
-          messageId: message.id,
-          roomId: message.roomId,
-          entityId: message.entityId,
-          startTime,
-          status: 'timeout',
-          endTime: Date.now(),
-          duration: Date.now() - startTime,
-          error: 'Run exceeded 60 minute timeout',
-          source: 'messageHandler',
-        });
-        reject(new Error('Run exceeded 60 minute timeout'));
-      }, timeoutDuration);
-    });
-
-    const processingPromise = (async () => {
-      try {
-        if (message.entityId === runtime.agentId) {
-          runtime.logger.debug(`[Bootstrap] Skipping message from self (${runtime.agentId})`);
-          throw new Error('Message is from the agent itself');
-        }
-
-        runtime.logger.debug(
-          `[Bootstrap] Processing message: ${truncateToCompleteSentence(message.content.text || '', 50)}...`
-        );
-
-        // First, save the incoming message
-        runtime.logger.debug('[Bootstrap] Saving message to memory and embeddings');
-
-        // Check if memory already exists (it might have been created by MessageBusService)
-        if (message.id) {
-          const existingMemory = await runtime.getMemoryById(message.id);
-          if (existingMemory) {
-            runtime.logger.debug('[Bootstrap] Memory already exists, skipping creation');
-            // Still add embedding if needed
-            await runtime.addEmbeddingToMemory(message);
-          } else {
-            // Create memory if it doesn't exist
-            await Promise.all([
-              runtime.addEmbeddingToMemory(message),
-              runtime.createMemory(message, 'messages'),
-            ]);
-          }
-        } else {
-          // No ID, create new memory
-          await Promise.all([
-            runtime.addEmbeddingToMemory(message),
-            runtime.createMemory(message, 'messages'),
-          ]);
-        }
-
-        const agentUserState = await runtime.getParticipantUserState(
-          message.roomId,
-          runtime.agentId
-        );
-
-        // default LLM to off
-        const defLllmOff = parseBooleanFromText(runtime.getSetting('BOOTSTRAP_DEFLLMOFF'));
-        if (defLllmOff && agentUserState === null) {
-          runtime.logger.debug('bootstrap - LLM is off by default');
-          // allow some other subsystem to handle this event
-          // maybe emit an event
-
-          // Emit run ended event on successful completion
-          await runtime.emitEvent(EventType.RUN_ENDED, {
-            runtime,
-            runId,
-            messageId: message.id,
-            roomId: message.roomId,
-            entityId: message.entityId,
-            startTime,
-            status: 'off',
-            endTime: Date.now(),
-            duration: Date.now() - startTime,
-            source: 'messageHandler',
-          });
-          return;
-        }
-
-        if (
-          agentUserState === 'MUTED' &&
-          !message.content.text?.toLowerCase().includes(runtime.character.name.toLowerCase())
-        ) {
-          runtime.logger.debug(`[Bootstrap] Ignoring muted room ${message.roomId}`);
-          // Emit run ended event on successful completion
-          await runtime.emitEvent(EventType.RUN_ENDED, {
-            runtime,
-            runId,
-            messageId: message.id,
-            roomId: message.roomId,
-            entityId: message.entityId,
-            startTime,
-            status: 'muted',
-            endTime: Date.now(),
-            duration: Date.now() - startTime,
-            source: 'messageHandler',
-          });
-          return;
-        }
-
-        let state = await runtime.composeState(
-          message,
-          ['ANXIETY', 'SHOULD_RESPOND', 'ENTITIES', 'CHARACTER', 'RECENT_MESSAGES', 'ACTIONS'],
-          true
-        );
-
-        // Skip shouldRespond check for DM and VOICE_DM channels
-        const room = await runtime.getRoom(message.roomId);
-
-        const shouldSkipShouldRespond = shouldBypassShouldRespond(
-          runtime,
-          room ?? undefined,
-          message.content.source
-        );
-
-        if (message.content.attachments && message.content.attachments.length > 0) {
-          message.content.attachments = await processAttachments(
-            message.content.attachments,
-            runtime
-          );
-          if (message.id) {
-            await runtime.updateMemory({
-              id: message.id,
-              content: message.content,
-            });
-          }
-        }
-
-        let shouldRespond = true;
-
-        // Handle shouldRespond
-        if (!shouldSkipShouldRespond) {
-          const shouldRespondPrompt = composePromptFromState({
-            state,
-            template: runtime.character.templates?.shouldRespondTemplate || shouldRespondTemplate,
-          });
-
-          runtime.logger.debug(
-            `[Bootstrap] Evaluating response for ${runtime.character.name}\nPrompt: ${shouldRespondPrompt}`
-          );
-
-          const response = await runtime.useModel(ModelType.TEXT_SMALL, {
-            prompt: shouldRespondPrompt,
-          });
-
-          runtime.logger.debug(
-            `[Bootstrap] Response evaluation for ${runtime.character.name}:\n${response}`
-          );
-          runtime.logger.debug(`[Bootstrap] Response type: ${typeof response}`);
-
-          // Try to preprocess response by removing code blocks markers if present
-          // let processedResponse = response.replace('```json', '').replaceAll('```', '').trim(); // No longer needed for XML
-
-          const responseObject = parseKeyValueXml(response);
-          runtime.logger.debug('[Bootstrap] Parsed response:', responseObject);
-
-          // If an action is provided, the agent intends to respond in some way
-          // Only exclude explicit non-response actions
-          const nonResponseActions = ['IGNORE', 'NONE'];
-          shouldRespond =
-            responseObject?.action &&
-            !nonResponseActions.includes(responseObject.action.toUpperCase());
-        } else {
-          runtime.logger.debug(
-            `[Bootstrap] Skipping shouldRespond check for ${runtime.character.name} because ${room?.type} ${room?.source}`
-          );
-          shouldRespond = true;
-        }
-
-        let responseMessages: Memory[] = [];
-
-        // I don't think we need these right now
-        //runtime.logger.debug('shouldRespond is', shouldRespond);
-        //runtime.logger.debug('shouldSkipShouldRespond', shouldSkipShouldRespond);
-
-        let responseContent: Content | null = null;
-
-        if (shouldRespond) {
-          state = await runtime.composeState(message, ['ACTIONS']);
-          if (!state.values.actionNames) {
-            runtime.logger.warn(
-              'actionNames data missing from state, even though it was requested'
-            );
-          }
-
-          const prompt = composePromptFromState({
-            state,
-            template: runtime.character.templates?.messageHandlerTemplate || messageHandlerTemplate,
-          });
-
-          // Retry if missing required fields
-          let retries = 0;
-          const maxRetries = 3;
-
-          while (retries < maxRetries && (!responseContent?.thought || !responseContent?.actions)) {
-            let response = await runtime.useModel(ModelType.TEXT_LARGE, {
-              prompt,
-            });
-
-            runtime.logger.debug('[Bootstrap] *** Raw LLM Response ***\n', response);
-
-            // Attempt to parse the XML response
-            const parsedXml = parseKeyValueXml(response);
-            runtime.logger.debug('[Bootstrap] *** Parsed XML Content ***\n', parsedXml);
-
-            // Map parsed XML to Content type, handling potential missing fields
-            if (parsedXml) {
-              responseContent = {
-                ...parsedXml,
-                thought: parsedXml.thought || '',
-                actions: parsedXml.actions || ['IGNORE'],
-                providers: parsedXml.providers || [],
-                text: parsedXml.text || '',
-                simple: parsedXml.simple || false,
-              };
-            } else {
-              responseContent = null;
-            }
-
-            retries++;
-            if (!responseContent?.thought || !responseContent?.actions) {
-              runtime.logger.warn(
-                '[Bootstrap] *** Missing required fields (thought or actions), retrying... ***\n',
-                response,
-                parsedXml,
-                responseContent
-              );
-            }
-          }
-
-          // Check if this is still the latest response ID for this agent+room
-          const currentResponseId = agentResponses.get(message.roomId);
-          if (currentResponseId !== responseId) {
-            runtime.logger.info(
-              `Response discarded - newer message being processed for agent: ${runtime.agentId}, room: ${message.roomId}`
-            );
-            return;
-          }
-
-          if (responseContent && message.id) {
-            responseContent.inReplyTo = createUniqueUuid(runtime, message.id);
-
-            // --- LLM IGNORE/REPLY ambiguity handling ---
-            // Sometimes the LLM outputs actions like ["REPLY", "IGNORE"], which breaks isSimple detection
-            // and triggers unnecessary large LLM calls. We clarify intent here:
-            // - If IGNORE is present with other actions:
-            //    - If text is empty, we assume the LLM intended to IGNORE and drop all other actions.
-            //    - If text is present, we assume the LLM intended to REPLY and remove IGNORE from actions.
-            // This ensures consistent, clear behavior and preserves reply speed optimizations.
-            if (responseContent.actions && responseContent.actions.length > 1) {
-              // filter out all NONE actions, there's nothing to be done with them
-              // oh but there is a none action in bootstrap
-              //responseContent.actions = responseContent.actions.filter(a => a !== 'NONE')
-
-              // Helper function to safely check if an action is IGNORE
-              const isIgnoreAction = (action: unknown): boolean => {
-                return typeof action === 'string' && action.toUpperCase() === 'IGNORE';
-              };
-
-              // Check if any action is IGNORE
-              const hasIgnoreAction = responseContent.actions.some(isIgnoreAction);
-
-              if (hasIgnoreAction) {
-                if (!responseContent.text || responseContent.text.trim() === '') {
-                  // No text, truly meant to IGNORE
-                  responseContent.actions = ['IGNORE'];
-                } else {
-                  // Text present, LLM intended to reply, remove IGNORE
-                  const filteredActions = responseContent.actions.filter(
-                    (action) => !isIgnoreAction(action)
-                  );
-
-                  // Ensure we don't end up with an empty actions array when text is present
-                  // If all actions were IGNORE, default to REPLY
-                  if (filteredActions.length === 0) {
-                    responseContent.actions = ['REPLY'];
-                  } else {
-                    responseContent.actions = filteredActions;
-                  }
-                }
-              }
-            }
-
-            // Automatically determine if response is simple based on providers and actions
-            // Simple = REPLY action with no providers used
-            const isSimple =
-              responseContent.actions?.length === 1 &&
-              typeof responseContent.actions[0] === 'string' &&
-              responseContent.actions[0].toUpperCase() === 'REPLY' &&
-              (!responseContent.providers || responseContent.providers.length === 0);
-
-            responseContent.simple = isSimple;
-
-            const responseMessage = {
-              id: asUUID(v4()),
-              entityId: runtime.agentId,
-              agentId: runtime.agentId,
-              content: responseContent,
-              roomId: message.roomId,
-              createdAt: Date.now(),
-            };
-
-            responseMessages = [responseMessage];
-          }
-
-          // Clean up the response ID
-          agentResponses.delete(message.roomId);
-          if (agentResponses.size === 0) {
-            latestResponseIds.delete(runtime.agentId);
-          }
-
-          if (responseContent?.providers?.length && responseContent?.providers?.length > 0) {
-            state = await runtime.composeState(message, responseContent?.providers || []);
-          }
-
-          if (responseContent && responseContent.simple && responseContent.text) {
-            // Log provider usage for simple responses
-            if (responseContent.providers && responseContent.providers.length > 0) {
-              runtime.logger.debug(
-                '[Bootstrap] Simple response used providers',
-                responseContent.providers
-              );
-            }
-
-            // without actions there can't be more than one message
-            await callback(responseContent);
-          } else {
-            await runtime.processActions(message, responseMessages, state, async (content) => {
-              runtime.logger.debug('action callback', content);
-              if (responseContent) {
-                responseContent.actionCallbacks = content;
-              }
-              return callback(content);
-            });
-          }
-          await runtime.evaluate(
-            message,
-            state,
-            shouldRespond,
-            async (content) => {
-              runtime.logger.debug('evaluate callback', content);
-              if (responseContent) {
-                responseContent.evalCallbacks = content;
-              }
-              return callback(content);
-            },
-            responseMessages
-          );
-        } else {
-          // Handle the case where the agent decided not to respond
-          runtime.logger.debug(
-            '[Bootstrap] Agent decided not to respond (shouldRespond is false).'
-          );
-
-          // Check if we still have the latest response ID
-          const currentResponseId = agentResponses.get(message.roomId);
-          // helpful for swarms
-          const keepResp = parseBooleanFromText(runtime.getSetting('BOOTSTRAP_KEEP_RESP'));
-          if (currentResponseId !== responseId && !keepResp) {
-            runtime.logger.info(
-              `Ignore response discarded - newer message being processed for agent: ${runtime.agentId}, room: ${message.roomId}`
-            );
-            // Emit run ended event on successful completion
-            await runtime.emitEvent(EventType.RUN_ENDED, {
-              runtime,
-              runId,
-              messageId: message.id,
-              roomId: message.roomId,
-              entityId: message.entityId,
-              startTime,
-              status: 'replaced',
-              endTime: Date.now(),
-              duration: Date.now() - startTime,
-              source: 'messageHandler',
-            });
-            return; // Stop processing if a newer message took over
-          }
-
-          if (!message.id) {
-            runtime.logger.error(
-              '[Bootstrap] Message ID is missing, cannot create ignore response.'
-            );
-            // Emit run ended event on successful completion
-            await runtime.emitEvent(EventType.RUN_ENDED, {
-              runtime,
-              runId,
-              messageId: message.id,
-              roomId: message.roomId,
-              entityId: message.entityId,
-              startTime,
-              status: 'noMessageId',
-              endTime: Date.now(),
-              duration: Date.now() - startTime,
-              source: 'messageHandler',
-            });
-            return;
-          }
-
-          // Construct a minimal content object indicating ignore, include a generic thought
-          const ignoreContent: Content = {
-            thought: 'Agent decided not to respond to this message.',
-            actions: ['IGNORE'],
-            simple: true, // Treat it as simple for callback purposes
-            inReplyTo: createUniqueUuid(runtime, message.id), // Reference original message
-          };
-
-          // Call the callback directly with the ignore content
-          await callback(ignoreContent);
-
-          // Also save this ignore action/thought to memory
-          const ignoreMemory = {
-            id: asUUID(v4()),
-            entityId: runtime.agentId,
-            agentId: runtime.agentId,
-            content: ignoreContent,
-            roomId: message.roomId,
-            createdAt: Date.now(),
-          };
-          await runtime.createMemory(ignoreMemory, 'messages');
-          runtime.logger.debug('[Bootstrap] Saved ignore response to memory', {
-            memoryId: ignoreMemory.id,
-          });
-
-          // Clean up the response ID since we handled it
-          agentResponses.delete(message.roomId);
-          if (agentResponses.size === 0) {
-            latestResponseIds.delete(runtime.agentId);
-          }
-
-          // Optionally, evaluate the decision to ignore (if relevant evaluators exist)
-          // await runtime.evaluate(message, state, shouldRespond, callback, []);
-        }
-
-        // ok who are they
-        let entityName = 'noname';
-        if (message.metadata && 'entityName' in message.metadata) {
-          entityName = (message.metadata as any).entityName;
-        }
-
-        const isDM = message.content?.channelType?.toUpperCase() === 'DM';
-        let roomName = entityName;
-        if (!isDM) {
-          const roomDatas = await runtime.getRoomsByIds([message.roomId]);
-          if (roomDatas?.length) {
-            const roomData = roomDatas[0];
-            if (roomData.name) {
-              // server/guild name?
-              roomName = roomData.name;
-            }
-            // how do I get worldName
-            if (roomData.worldId) {
-              const worldData = await runtime.getWorld(roomData.worldId);
-              if (worldData) {
-                roomName = worldData.name + '-' + roomName;
-              }
-            }
-          }
-        }
-
-        const date = new Date();
-
-        // get available actions
-        const availableActions = state.data?.providers?.ACTIONS?.data?.actionsData?.map(
-          (a) => a.name
-        ) || [-1];
-
-        // generate data of interest
-        const logData = {
-          at: date.toString(),
-          timestamp: parseInt('' + date.getTime() / 1000),
-          messageId: message.id, // can extract roomId or whatever
-          userEntityId: message.entityId,
-          input: message.content.text,
-          thought: responseContent?.thought,
-          simple: responseContent?.simple,
-          availableActions,
-          actions: responseContent?.actions,
-          providers: responseContent?.providers,
-          irt: responseContent?.inReplyTo,
-          output: responseContent?.text,
-          // to strip out
-          entityName,
-          source: message.content.source,
-          channelType: message.content.channelType,
-          roomName,
-        };
-
-        // Emit run ended event on successful completion
-        await runtime.emitEvent(EventType.RUN_ENDED, {
-          runtime,
-          runId,
-          messageId: message.id,
-          roomId: message.roomId,
-          entityId: message.entityId,
-          startTime,
-          status: 'completed',
-          endTime: Date.now(),
-          duration: Date.now() - startTime,
-          source: 'messageHandler',
-          entityName,
-          responseContent,
-          metadata: logData,
-        });
-      } catch (error: any) {
-        console.error('error is', error);
-        // Emit run ended event with error
-        await runtime.emitEvent(EventType.RUN_ENDED, {
-          runtime,
-          runId,
-          messageId: message.id,
-          roomId: message.roomId,
-          entityId: message.entityId,
-          startTime,
-          status: 'error',
-          endTime: Date.now(),
-          duration: Date.now() - startTime,
-          error: error.message,
-          source: 'messageHandler',
-        });
-      }
-    })();
-
-    await Promise.race([processingPromise, timeoutPromise]);
-  } finally {
-    clearTimeout(timeoutId);
-    onComplete?.();
+  const sourceStr = message.content.source?.toLowerCase() || '';
+
+  // 1. DM/VOICE_DM/API channels: always respond (private channels)
+  if (respondChannels.has(roomType)) {
+    return { shouldRespond: true, skipEvaluation: true, reason: `private channel: ${roomType}` };
   }
-};
+
+  // 2. Specific sources (e.g., client_chat): always respond
+  if (respondSources.some((pattern) => sourceStr.includes(pattern))) {
+    return {
+      shouldRespond: true,
+      skipEvaluation: true,
+      reason: `whitelisted source: ${sourceStr}`,
+    };
+  }
+
+  // 3. Platform mentions and replies: always respond
+  // This is the key feature from mentionContext - platform-detected mentions/replies
+  const hasPlatformMention = !!(mentionContext?.isMention || mentionContext?.isReply);
+  if (hasPlatformMention) {
+    const mentionType = mentionContext?.isMention ? 'mention' : 'reply';
+    return { shouldRespond: true, skipEvaluation: true, reason: `platform ${mentionType}` };
+  }
+
+  // 4. All other cases: let the LLM decide
+  // The LLM will handle: text-based name detection, indirect questions, conversation context, etc.
+  return { shouldRespond: false, skipEvaluation: false, reason: 'needs LLM evaluation' };
+}
 
 /**
  * Handles the receipt of a reaction message and creates a memory in the designated memory manager.
@@ -917,94 +379,7 @@ const reactionReceivedHandler = async ({
       runtime.logger.warn('[Bootstrap] Duplicate reaction memory, skipping');
       return;
     }
-    runtime.logger.error('[Bootstrap] Error in reaction handler:', error);
-  }
-};
-
-/**
- * Handles message deletion events by removing the corresponding memory from the agent's memory store.
- *
- * @param {Object} params - The parameters for the function.
- * @param {IAgentRuntime} params.runtime - The agent runtime object.
- * @param {Memory} params.message - The message memory that was deleted.
- * @returns {void}
- */
-const messageDeletedHandler = async ({
-  runtime,
-  message,
-}: {
-  runtime: IAgentRuntime;
-  message: Memory;
-}) => {
-  try {
-    if (!message.id) {
-      runtime.logger.error('[Bootstrap] Cannot delete memory: message ID is missing');
-      return;
-    }
-
-    runtime.logger.info(
-      '[Bootstrap] Deleting memory for message',
-      message.id,
-      'from room',
-      message.roomId
-    );
-    await runtime.deleteMemory(message.id);
-    runtime.logger.debug('[Bootstrap] Successfully deleted memory for message', message.id);
-  } catch (error: unknown) {
-    runtime.logger.error('[Bootstrap] Error in message deleted handler:', error);
-  }
-};
-
-/**
- * Handles channel cleared events by removing all message memories from the specified room.
- *
- * @param {Object} params - The parameters for the function.
- * @param {IAgentRuntime} params.runtime - The agent runtime object.
- * @param {UUID} params.roomId - The room ID to clear message memories from.
- * @param {string} params.channelId - The original channel ID.
- * @param {number} params.memoryCount - Number of memories found.
- * @returns {void}
- */
-const channelClearedHandler = async ({
-  runtime,
-  roomId,
-  channelId,
-  memoryCount,
-}: {
-  runtime: IAgentRuntime;
-  roomId: UUID;
-  channelId: string;
-  memoryCount: number;
-}) => {
-  try {
-    runtime.logger.info(
-      `[Bootstrap] Clearing ${memoryCount} message memories from channel ${channelId} -> room ${roomId}`
-    );
-
-    // Get all message memories for this room
-    const memories = await runtime.getMemoriesByRoomIds({
-      tableName: 'messages',
-      roomIds: [roomId],
-    });
-
-    // Delete each message memory
-    let deletedCount = 0;
-    for (const memory of memories) {
-      if (memory.id) {
-        try {
-          await runtime.deleteMemory(memory.id);
-          deletedCount++;
-        } catch (error) {
-          runtime.logger.warn(`[Bootstrap] Failed to delete message memory ${memory.id}:`, error);
-        }
-      }
-    }
-
-    runtime.logger.info(
-      `[Bootstrap] Successfully cleared ${deletedCount}/${memories.length} message memories from channel ${channelId}`
-    );
-  } catch (error: unknown) {
-    runtime.logger.error('[Bootstrap] Error in channel cleared handler:', error);
+    runtime.logger.error({ error }, '[Bootstrap] Error in reaction handler:');
   }
 };
 
@@ -1088,9 +463,6 @@ const postGeneratedHandler = async ({
     const response = await runtime.useModel(ModelType.TEXT_SMALL, {
       prompt,
     });
-
-    console.log('prompt is', prompt);
-    console.log('response is', response);
 
     // Parse XML
     const parsedXml = parseKeyValueXml(response);
@@ -1179,11 +551,11 @@ const postGeneratedHandler = async ({
   // }
 
   // have we posted it before?
-  const RM = state.providerData?.find((pd) => pd.providerName === 'RECENT_MESSAGES');
+  const RM = state.data?.providers?.RECENT_MESSAGES;
   if (RM) {
     for (const m of RM.data.recentMessages) {
       if (cleanedText === m.content.text) {
-        runtime.logger.info('[Bootstrap] Already recently posted that, retrying', cleanedText);
+        runtime.logger.info({ cleanedText }, '[Bootstrap] Already recently posted that, retrying');
         postGeneratedHandler({
           runtime,
           callback,
@@ -1214,7 +586,7 @@ const postGeneratedHandler = async ({
     googleRefusalRegex.test(cleanedText) ||
     generalRefusalRegex.test(cleanedText)
   ) {
-    runtime.logger.info('[Bootstrap] Got prompt moderation refusal, retrying', cleanedText);
+    runtime.logger.info({ cleanedText }, '[Bootstrap] Got prompt moderation refusal, retrying');
     postGeneratedHandler({
       runtime,
       callback,
@@ -1382,14 +754,7 @@ const controlMessageHandler = async ({
   message,
 }: {
   runtime: IAgentRuntime;
-  message: {
-    type: 'control';
-    payload: {
-      action: 'enable_input' | 'disable_input';
-      target?: string;
-    };
-    roomId: UUID;
-  };
+  message: ControlMessage;
   source: string;
 }) => {
   try {
@@ -1438,43 +803,10 @@ const controlMessageHandler = async ({
   }
 };
 
-const events = {
-  [EventType.MESSAGE_RECEIVED]: [
-    async (payload: MessagePayload) => {
-      if (!payload.callback) {
-        payload.runtime.logger.error('No callback provided for message');
-        return;
-      }
-      await messageReceivedHandler({
-        runtime: payload.runtime,
-        message: payload.message,
-        callback: payload.callback,
-        onComplete: payload.onComplete,
-      });
-    },
-  ],
-
-  [EventType.VOICE_MESSAGE_RECEIVED]: [
-    async (payload: MessagePayload) => {
-      if (!payload.callback) {
-        payload.runtime.logger.error('No callback provided for voice message');
-        return;
-      }
-      await messageReceivedHandler({
-        runtime: payload.runtime,
-        message: payload.message,
-        callback: payload.callback,
-        onComplete: payload.onComplete,
-      });
-    },
-  ],
-
+const events: PluginEvents = {
   [EventType.REACTION_RECEIVED]: [
     async (payload: MessagePayload) => {
-      await reactionReceivedHandler({
-        runtime: payload.runtime,
-        message: payload.message,
-      });
+      await reactionReceivedHandler(payload);
     },
   ],
 
@@ -1487,26 +819,6 @@ const events = {
   [EventType.MESSAGE_SENT]: [
     async (payload: MessagePayload) => {
       payload.runtime.logger.debug(`[Bootstrap] Message sent: ${payload.message.content.text}`);
-    },
-  ],
-
-  [EventType.MESSAGE_DELETED]: [
-    async (payload: MessagePayload) => {
-      await messageDeletedHandler({
-        runtime: payload.runtime,
-        message: payload.message,
-      });
-    },
-  ],
-
-  [EventType.CHANNEL_CLEARED]: [
-    async (payload: EventPayload & { roomId: UUID; channelId: string; memoryCount: number }) => {
-      await channelClearedHandler({
-        runtime: payload.runtime,
-        roomId: payload.roomId,
-        channelId: payload.channelId,
-        memoryCount: payload.memoryCount,
-      });
     },
   ],
 
@@ -1569,21 +881,77 @@ const events = {
           `[Bootstrap] User ${payload.entityId} left world ${payload.worldId}`
         );
       } catch (error: any) {
-        payload.runtime.logger.error(`[Bootstrap] Error handling user left: ${error.message}`);
+        payload.runtime.logger.error(
+          '[Bootstrap] Error handling user left:',
+          error instanceof Error ? error.message : String(error)
+        );
       }
     },
   ],
 
   [EventType.ACTION_STARTED]: [
     async (payload: ActionEventPayload) => {
-      logger.debug(`[Bootstrap] Action started: ${payload.actionName} (${payload.actionId})`);
+      try {
+        // Only notify for client_chat messages
+        if (payload.content?.source === 'client_chat') {
+          const messageBusService = payload.runtime.getService('message-bus-service') as any;
+          if (messageBusService) {
+            await messageBusService.notifyActionStart(
+              payload.roomId,
+              payload.world,
+              payload.content,
+              payload.messageId
+            );
+          }
+        }
+      } catch (error) {
+        logger.error(`[Bootstrap] Error sending refetch request: ${error}`);
+      }
+    },
+    async (payload: ActionEventPayload) => {
+      try {
+        await payload.runtime.log({
+          entityId: payload.runtime.agentId,
+          roomId: payload.roomId,
+          type: 'action_event',
+          body: {
+            runId: payload.content?.runId,
+            actionId: payload.content?.actionId,
+            actionName: payload.content?.actions?.[0],
+            roomId: payload.roomId,
+            messageId: payload.messageId,
+            timestamp: Date.now(),
+            planStep: payload.content?.planStep,
+            source: 'actionHandler',
+          },
+        });
+        logger.debug(
+          `[Bootstrap] Logged ACTION_STARTED event for action ${payload.content?.actions?.[0]}`
+        );
+      } catch (error) {
+        logger.error(`[Bootstrap] Failed to log ACTION_STARTED event: ${error}`);
+      }
     },
   ],
 
   [EventType.ACTION_COMPLETED]: [
     async (payload: ActionEventPayload) => {
-      const status = payload.error ? `failed: ${payload.error.message}` : 'completed';
-      logger.debug(`[Bootstrap] Action ${status}: ${payload.actionName} (${payload.actionId})`);
+      try {
+        // Only notify for client_chat messages
+        if (payload.content?.source === 'client_chat') {
+          const messageBusService = payload.runtime.getService('message-bus-service') as any;
+          if (messageBusService) {
+            await messageBusService.notifyActionUpdate(
+              payload.roomId,
+              payload.world,
+              payload.content,
+              payload.messageId
+            );
+          }
+        }
+      } catch (error) {
+        logger.error(`[Bootstrap] Error sending refetch request: ${error}`);
+      }
     },
   ],
 
@@ -1601,6 +969,86 @@ const events = {
       logger.debug(
         `[Bootstrap] Evaluator ${status}: ${payload.evaluatorName} (${payload.evaluatorId})`
       );
+    },
+  ],
+
+  [EventType.RUN_STARTED]: [
+    async (payload: RunEventPayload) => {
+      try {
+        await payload.runtime.log({
+          entityId: payload.entityId,
+          roomId: payload.roomId,
+          type: 'run_event',
+          body: {
+            runId: payload.runId,
+            status: payload.status,
+            messageId: payload.messageId,
+            roomId: payload.roomId,
+            entityId: payload.entityId,
+            startTime: payload.startTime,
+            source: payload.source || 'unknown',
+          },
+        });
+        logger.debug(`[Bootstrap] Logged RUN_STARTED event for run ${payload.runId}`);
+      } catch (error) {
+        logger.error(`[Bootstrap] Failed to log RUN_STARTED event: ${error}`);
+      }
+    },
+  ],
+
+  [EventType.RUN_ENDED]: [
+    async (payload: RunEventPayload) => {
+      try {
+        await payload.runtime.log({
+          entityId: payload.entityId,
+          roomId: payload.roomId,
+          type: 'run_event',
+          body: {
+            runId: payload.runId,
+            status: payload.status,
+            messageId: payload.messageId,
+            roomId: payload.roomId,
+            entityId: payload.entityId,
+            startTime: payload.startTime,
+            endTime: payload.endTime,
+            duration: payload.duration,
+            error: payload.error,
+            source: payload.source || 'unknown',
+          },
+        });
+        logger.debug(
+          `[Bootstrap] Logged RUN_ENDED event for run ${payload.runId} with status ${payload.status}`
+        );
+      } catch (error) {
+        logger.error(`[Bootstrap] Failed to log RUN_ENDED event: ${error}`);
+      }
+    },
+  ],
+
+  [EventType.RUN_TIMEOUT]: [
+    async (payload: RunEventPayload) => {
+      try {
+        await payload.runtime.log({
+          entityId: payload.entityId,
+          roomId: payload.roomId,
+          type: 'run_event',
+          body: {
+            runId: payload.runId,
+            status: payload.status,
+            messageId: payload.messageId,
+            roomId: payload.roomId,
+            entityId: payload.entityId,
+            startTime: payload.startTime,
+            endTime: payload.endTime,
+            duration: payload.duration,
+            error: payload.error,
+            source: payload.source || 'unknown',
+          },
+        });
+        logger.debug(`[Bootstrap] Logged RUN_TIMEOUT event for run ${payload.runId}`);
+      } catch (error) {
+        logger.error(`[Bootstrap] Failed to log RUN_TIMEOUT event: ${error}`);
+      }
     },
   ],
 
@@ -1625,8 +1073,7 @@ export const bootstrapPlugin: Plugin = {
     actions.updateSettingsAction,
     actions.generateImageAction,
   ],
-  // this is jank, these events are not valid
-  events: events as any as PluginEvents,
+  events: events,
   evaluators: [evaluators.reflectionEvaluator],
   providers: [
     providers.evaluatorsProvider,
@@ -1638,7 +1085,8 @@ export const bootstrapPlugin: Plugin = {
     providers.factsProvider,
     providers.roleProvider,
     providers.settingsProvider,
-    providers.capabilitiesProvider,
+    // there is given no reason for this - odi
+    //providers.capabilitiesProvider,
     providers.attachmentsProvider,
     providers.providersProvider,
     providers.actionsProvider,
@@ -1647,7 +1095,7 @@ export const bootstrapPlugin: Plugin = {
     providers.recentMessagesProvider,
     providers.worldProvider,
   ],
-  services: [TaskService],
+  services: [TaskService, EmbeddingGenerationService],
 };
 
 export default bootstrapPlugin;

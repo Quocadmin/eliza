@@ -6,6 +6,8 @@ import { AudioService } from './services/audio';
 import { MediaService } from './services/media';
 import { ServerService } from './services/server';
 import { SystemService } from './services/system';
+import { SessionsService } from './services/sessions';
+import { RunsService } from './services/runs';
 
 export class ElizaClient {
   public readonly agents: AgentsService;
@@ -15,6 +17,8 @@ export class ElizaClient {
   public readonly media: MediaService;
   public readonly server: ServerService;
   public readonly system: SystemService;
+  public readonly sessions: SessionsService;
+  public readonly runs: RunsService;
 
   constructor(config: ApiClientConfig) {
     // Initialize all services with the same config
@@ -25,6 +29,8 @@ export class ElizaClient {
     this.media = new MediaService(config);
     this.server = new ServerService(config);
     this.system = new SystemService(config);
+    this.sessions = new SessionsService(config);
+    this.runs = new RunsService(config);
   }
 
   /**

@@ -4,7 +4,7 @@ import { PaginationParams } from './base';
 export interface Agent {
   id: UUID;
   name: string;
-  description?: string;
+  bio?: string | string[];
   status: 'active' | 'inactive' | 'stopped';
   enabled?: boolean;
   createdAt: Date;
@@ -20,7 +20,7 @@ export interface AgentCreateParams {
 
 export interface AgentUpdateParams {
   name?: string;
-  description?: string;
+  bio?: string | string[];
   metadata?: Record<string, any>;
 }
 
@@ -45,12 +45,25 @@ export interface AgentPanel {
 }
 
 export interface AgentLog {
-  id: UUID;
-  agentId: UUID;
-  level: 'debug' | 'info' | 'warn' | 'error';
-  message: string;
-  timestamp: Date;
-  metadata?: Record<string, any>;
+  id?: UUID;
+  type?: string;
+  timestamp?: number;
+  message?: string;
+  details?: string;
+  roomId?: UUID;
+  body?: {
+    modelType?: string;
+    modelKey?: string;
+    params?: any;
+    response?: any;
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+    };
+  };
+  createdAt?: number;
+  [key: string]: any;
 }
 
 export interface AgentLogsParams extends PaginationParams {

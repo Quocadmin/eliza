@@ -1,8 +1,7 @@
-import type { Agent, Character, IAgentRuntime, UUID } from '@elizaos/core';
+import type { Agent, Character, ElizaOS } from '@elizaos/core';
 import {
   validateUuid,
   logger,
-  stringToUuid,
   getSalt,
   encryptObjectValues,
   encryptStringValue,
@@ -15,7 +14,7 @@ import { sendError, sendSuccess } from '../shared/response-utils';
  * Agent CRUD operations
  */
 export function createAgentCrudRouter(
-  agents: Map<UUID, IAgentRuntime>,
+  elizaOS: ElizaOS,
   serverInstance: AgentServer
 ): express.Router {
   const router = express.Router();
@@ -28,7 +27,7 @@ export function createAgentCrudRouter(
         return sendError(res, 500, 'DB_ERROR', 'Database not available');
       }
       const allAgents = await db.getAgents();
-      const runtimes = Array.from(agents.keys());
+      const runtimes = elizaOS.getAgents().map((a) => a.agentId);
 
       // Return only minimal agent data
       const response = allAgents
@@ -49,7 +48,10 @@ export function createAgentCrudRouter(
 
       sendSuccess(res, { agents: response });
     } catch (error) {
-      logger.error('[AGENTS LIST] Error retrieving agents:', error);
+      logger.error(
+        '[AGENTS LIST] Error retrieving agents:',
+        error instanceof Error ? error.message : String(error)
+      );
       sendError(
         res,
         500,
@@ -76,7 +78,7 @@ export function createAgentCrudRouter(
         return sendError(res, 404, 'NOT_FOUND', 'Agent not found');
       }
 
-      const runtime = agents.get(agentId);
+      const runtime = elizaOS.getAgent(agentId);
       const response = {
         ...agent,
         status: runtime ? 'active' : 'inactive',
@@ -84,7 +86,10 @@ export function createAgentCrudRouter(
 
       sendSuccess(res, response);
     } catch (error) {
-      logger.error('[AGENT GET] Error retrieving agent:', error);
+      logger.error(
+        '[AGENT GET] Error retrieving agent:',
+        error instanceof Error ? error.message : String(error)
+      );
       sendError(
         res,
         500,
@@ -123,14 +128,21 @@ export function createAgentCrudRouter(
         throw new Error('Failed to create character configuration');
       }
 
-      if (character.settings?.secrets) {
+      if (character.settings?.secrets && typeof character.settings.secrets === 'object') {
         logger.debug('[AGENT CREATE] Encrypting secrets');
         const salt = getSalt();
-        character.settings.secrets = encryptObjectValues(character.settings.secrets, salt);
+        character.settings.secrets = encryptObjectValues(
+          character.settings.secrets as Record<string, any>,
+          salt
+        );
       }
 
       const ensureAgentExists = async (character: Character) => {
-        const agentId = stringToUuid(character.name);
+        // Ensure character has an ID - if not, it should have been set during loading
+        if (!character.id) {
+          throw new Error('Character must have an ID');
+        }
+        const agentId = character.id;
         let agent = await db.getAgent(agentId);
         if (!agent) {
           await db.createAgent({ ...character, id: agentId });
@@ -154,7 +166,10 @@ export function createAgentCrudRouter(
       });
       logger.success(`[AGENT CREATE] Successfully created agent: ${character.name}`);
     } catch (error) {
-      logger.error('[AGENT CREATE] Error creating agent:', error);
+      logger.error(
+        '[AGENT CREATE] Error creating agent:',
+        error instanceof Error ? error.message : String(error)
+      );
       res.status(400).json({
         success: false,
         error: {
@@ -179,6 +194,10 @@ export function createAgentCrudRouter(
     const updates = req.body;
 
     try {
+      // Get current agent state before update to detect critical changes
+      const currentAgent = await db.getAgent(agentId);
+      const activeRuntime = elizaOS.getAgent(agentId);
+
       if (updates.settings?.secrets) {
         const salt = getSalt();
         const encryptedSecrets: Record<string, string | null> = {};
@@ -200,18 +219,95 @@ export function createAgentCrudRouter(
 
       const updatedAgent = await db.getAgent(agentId);
 
-      const isActive = !!agents.get(agentId);
-      if (isActive && updatedAgent) {
-        serverInstance?.unregisterAgent(agentId);
-        await serverInstance?.startAgent(updatedAgent);
+      // Detect if plugins have changed - this requires a full restart
+      let needsRestart = false;
+      if (currentAgent && activeRuntime && updatedAgent) {
+        // Validate plugins array structure
+        if (updatedAgent.plugins && !Array.isArray(updatedAgent.plugins)) {
+          throw new Error('plugins must be an array');
+        }
+
+        const currentPlugins = (currentAgent.plugins || [])
+          .filter((p) => p != null)
+          .map((p) => (typeof p === 'string' ? p : (p as any).name))
+          .filter((name) => typeof name === 'string')
+          .sort();
+
+        const updatedPlugins = (updatedAgent.plugins || [])
+          .filter((p) => p != null)
+          .map((p) => (typeof p === 'string' ? p : (p as any).name))
+          .filter((name) => typeof name === 'string')
+          .sort();
+
+        const pluginsChanged =
+          currentPlugins.length !== updatedPlugins.length ||
+          currentPlugins.some((plugin, idx) => plugin !== updatedPlugins[idx]);
+
+        needsRestart = pluginsChanged;
+
+        if (needsRestart) {
+          logger.debug(`[AGENT UPDATE] Agent ${agentId} requires restart due to plugins changes`);
+        }
       }
 
-      const runtime = agents.get(agentId);
+      // Check if agent is currently active
+      if (activeRuntime && updatedAgent) {
+        if (needsRestart) {
+          // Plugins changed - need full restart
+          logger.debug(`[AGENT UPDATE] Restarting agent ${agentId} due to configuration changes`);
+
+          try {
+            await serverInstance?.unregisterAgent(agentId);
+
+            // Restart the agent with new configuration
+            const { enabled, status, createdAt, updatedAt, ...characterData } = updatedAgent;
+            const runtimes = await serverInstance?.startAgents([
+              { character: characterData as Character },
+            ]);
+            if (!runtimes || runtimes.length === 0) {
+              throw new Error('Failed to restart agent after configuration change');
+            }
+            logger.success(`[AGENT UPDATE] Agent ${agentId} restarted successfully`);
+          } catch (restartError) {
+            logger.error(
+              { error: restartError, agentId },
+              `[AGENT UPDATE] Failed to restart agent ${agentId}, attempting to restore previous state`
+            );
+
+            // Try to restore the agent with the previous configuration
+            try {
+              const { enabled, status, createdAt, updatedAt, ...previousCharacterData } =
+                currentAgent!;
+              await serverInstance?.startAgents([
+                { character: previousCharacterData as Character },
+              ]);
+              logger.warn(`[AGENT UPDATE] Restored agent ${agentId} to previous state`);
+            } catch (restoreError) {
+              logger.error(
+                { error: restoreError, agentId },
+                `[AGENT UPDATE] Failed to restore agent ${agentId} - agent may be in broken state`
+              );
+            }
+
+            throw restartError;
+          }
+        } else {
+          // Only character properties changed - can update in-place
+          const { enabled, status, createdAt, updatedAt, ...characterData } = updatedAgent;
+          await elizaOS.updateAgent(agentId, characterData as Character);
+          logger.debug(`[AGENT UPDATE] Updated active agent ${agentId} without restart`);
+        }
+      }
+
+      const runtime = elizaOS.getAgent(agentId);
       const status = runtime ? 'active' : 'inactive';
 
       sendSuccess(res, { ...updatedAgent, status });
     } catch (error) {
-      logger.error('[AGENT UPDATE] Error updating agent:', error);
+      logger.error(
+        '[AGENT UPDATE] Error updating agent:',
+        error instanceof Error ? error.message : String(error)
+      );
       sendError(
         res,
         500,
@@ -246,7 +342,10 @@ export function createAgentCrudRouter(
 
       logger.debug(`[AGENT DELETE] Agent found: ${agent.name} (${agentId})`);
     } catch (checkError) {
-      logger.error(`[AGENT DELETE] Error checking if agent exists: ${agentId}`, checkError);
+      logger.error(
+        `[AGENT DELETE] Error checking if agent exists: ${agentId}`,
+        checkError instanceof Error ? checkError.message : String(checkError)
+      );
     }
 
     const timeoutId = setTimeout(() => {
@@ -267,14 +366,17 @@ export function createAgentCrudRouter(
 
     while (retryCount <= MAX_RETRIES) {
       try {
-        const runtime = agents.get(agentId);
+        const runtime = elizaOS.getAgent(agentId);
         if (runtime) {
           logger.debug(`[AGENT DELETE] Agent ${agentId} is running, unregistering from server`);
           try {
-            serverInstance?.unregisterAgent(agentId);
+            await serverInstance?.unregisterAgent(agentId);
             logger.debug(`[AGENT DELETE] Agent ${agentId} unregistered successfully`);
           } catch (stopError) {
-            logger.error(`[AGENT DELETE] Error stopping agent ${agentId}:`, stopError);
+            logger.error(
+              `[AGENT DELETE] Error stopping agent ${agentId}:`,
+              stopError instanceof Error ? stopError.message : String(stopError)
+            );
           }
         } else {
           logger.debug(`[AGENT DELETE] Agent ${agentId} was not running, no need to unregister`);
@@ -300,7 +402,7 @@ export function createAgentCrudRouter(
 
         logger.error(
           `[AGENT DELETE] Error deleting agent ${agentId} (attempt ${retryCount}/${MAX_RETRIES + 1}):`,
-          error
+          error instanceof Error ? error.message : String(error)
         );
 
         if (retryCount > MAX_RETRIES) {

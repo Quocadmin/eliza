@@ -118,7 +118,7 @@ export class TaskService extends Service {
       try {
         await this.checkTasks();
       } catch (error) {
-        logger.error('[Bootstrap] Error checking tasks:', error);
+        logger.error({ error }, '[Bootstrap] Error checking tasks:');
       }
     }, this.TICK_INTERVAL) as unknown as NodeJS.Timeout;
   }
@@ -156,7 +156,10 @@ export class TaskService extends Service {
             continue;
           }
         } catch (error) {
-          logger.error(`[Bootstrap] Error validating task ${task.name}:`, error);
+          logger.error(
+            { error, taskName: task.name },
+            `[Bootstrap] Error validating task ${task.name}:`
+          );
           continue;
         }
       }
@@ -178,6 +181,10 @@ export class TaskService extends Service {
       const allTasks = await this.runtime.getTasks({
         tags: ['queue'],
       });
+
+      if (!allTasks) {
+        return;
+      }
 
       // validate the tasks and sort them
       const tasks = await this.validateTasks(allTasks);
@@ -233,7 +240,7 @@ export class TaskService extends Service {
         }
       }
     } catch (error) {
-      logger.error('[Bootstrap] Error checking tasks:', error);
+      logger.error({ error }, '[Bootstrap] Error checking tasks:');
     }
   }
 
@@ -282,7 +289,7 @@ export class TaskService extends Service {
         );
       }
     } catch (error) {
-      logger.error(`[Bootstrap] Error executing task ${task.id}:`, error);
+      logger.error({ error, taskId: task.id }, `[Bootstrap] Error executing task ${task.id}:`);
     }
   }
 
